@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+/plugin/;
+
+&spi {
+        pinctrl-names = "default";
+        pinctrl-0 = <&spi0_pins>;
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	my_shift_register@0 {
+		compatible = "myvendor,my-shift-register";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		status = "okay";
+	};
+};
+
+&gpio {
+    spi0_pins: spi0_pins {
+        brcm,pins = <8 10 11>;
+        brcm,function = <4>;
+    };
+};
