@@ -11,44 +11,121 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/miscdevice.h>
+#include <linux/string.h>
 
 #include <linux/spi/spi.h>
 
 #include <asm/errno.h>
 
 #define DEVICE_NAME		"my_shift_register"
-#define FIRST_LED_MASK		0x02
-#define SECOND_LED_MASK		0x04
-#define THIRD_LED_MASK		0x08
-#define FOURTH_LED_MASK		0x10
+
+#define SHIFT_REG_MAX_INPUT	20
+
+static ssize_t shift_reg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos);
+static int shift_reg_open(struct inode *inode, struct file *file);
 
 struct shift_register_data {
 	struct spi_device *spi;
 	struct mutex lock;
 	struct delayed_work work;
-	bool on;
+	struct miscdevice miscdev;
 
-	u8 pattern;
+	u16 pattern;
 };
+
+static const struct file_operations fops = {
+	.owner = THIS_MODULE,
+	.write = shift_reg_write,
+	.open = shift_reg_open,
+};
+
+static void write_spi_output_mask(struct shift_register_data *data, u8 value);
+
+static int shift_reg_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *mdev = file->private_data;
+	struct shift_register_data *data = container_of(mdev, struct shift_register_data, miscdev);
+
+	file->private_data = data;
+
+	return 0;
+}
+
+static void blink_led_pattern(struct shift_register_data *data)
+{
+	u16 pattern = data->pattern;
+
+	while (pattern) {
+		write_spi_output_mask(data, pattern & 0x0F);
+		pattern >>= 4;
+	}
+}
+
+static ssize_t shift_reg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct shift_register_data *data = file->private_data;
+	char *kbuf, *p, *token;
+	size_t len;
+	int ret = 0;
+	u8 value;
+	u16 pattern = 0;
+
+	if (!data || !data->spi)
+		return -ENODEV;
+
+	len = min_t(size_t, count, SHIFT_REG_MAX_INPUT);
+
+	kbuf = memdup_user_nul(buf, len);
+	if (IS_ERR(kbuf))
+		return PTR_ERR(kbuf);
+
+	if (len > 0 && kbuf[len - 1] == '\n')
+		kbuf[--len] = '\0';
+
+	p = kbuf;
+
+	while((token = strsep(&p, " \t\n")) != NULL) {
+		if (*token == '\0')
+			continue;
+
+		ret = kstrtou8(token, 2, &value);
+		if (ret)
+			goto out;
+
+		if (value > 0x0F) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		pattern = (pattern << 4) | value;
+	} 
+
+	mutex_lock(&data->lock);
+	data->pattern = pattern;
+	mutex_unlock(&data->lock);
+
+	schedule_delayed_work(&data->work, msecs_to_jiffies(250));
+
+	ret = count;
+out:
+	kfree(kbuf);
+	return ret;
+}
 
 static void write_spi_output_mask(struct shift_register_data *data, u8 value)
 {
 	int ret;
 
-	ret = spi_write(data->spi, &value, 1);
+	u8 value_padded = (value << 1) & 0x1E;
+
+	ret = spi_write(data->spi, &value_padded, 1);
 	if (ret)
 		dev_err(&data->spi->dev, "spi_write failed: %d\n", ret);
 
-	msleep(1000);
+	msleep(500);
 }
 
-static void blink_led_pattern(struct shift_register_data *data)
-{
-	if (data->on) {
-		write_spi_output_mask(data, FOURTH_LED_MASK + THIRD_LED_MASK);
-		write_spi_output_mask(data, SECOND_LED_MASK + FIRST_LED_MASK);
-	}
-}
 
 static void worker(struct work_struct *work)
 {
@@ -60,11 +137,13 @@ static void worker(struct work_struct *work)
 		return;
 	}
 
+	u16 pattern;
+
 	mutex_lock(&data->lock);
+	pattern = data->pattern;
+	mutex_unlock(&data->lock);
 
 	blink_led_pattern(data);
-
-	mutex_unlock(&data->lock);
 
 	schedule_delayed_work(&data->work, 0);
 }
@@ -74,14 +153,11 @@ static int device_probe(struct spi_device *dev)
 	struct shift_register_data *data;
 	int ret;
 
-	dev_info(&dev->dev, "probe called\n");
-
 	data = devm_kzalloc(&dev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
 	data->spi = dev;
-	data->on = true;
 
 	mutex_init(&data->lock);
 	spi_set_drvdata(dev, data);
@@ -95,9 +171,18 @@ static int device_probe(struct spi_device *dev)
 		return ret;
 	}
 
-	INIT_DELAYED_WORK(&data->work, worker);
-	schedule_delayed_work(&data->work, msecs_to_jiffies(250));
+	data->miscdev.name = DEVICE_NAME;
+	data->miscdev.minor = MISC_DYNAMIC_MINOR;
+	data->miscdev.fops = &fops;
+	data->miscdev.parent = &dev->dev;
 
+	ret = misc_register(&data->miscdev);
+	if (ret) {
+		dev_err(&dev->dev, "Failed to initialize shift reg misc device driver");
+		return ret;
+	}
+
+	INIT_DELAYED_WORK(&data->work, worker);
 	dev_info(&dev->dev, "probe finished\n");
 
 	return 0;
@@ -108,6 +193,7 @@ static void device_remove(struct spi_device *dev)
 	struct shift_register_data *data = spi_get_drvdata(dev);
 
 	cancel_delayed_work_sync(&data->work);
+	misc_deregister(&data->miscdev);
 }
 
 static const struct of_device_id shift_register_of_match[] = {
